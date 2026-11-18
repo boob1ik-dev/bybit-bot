@@ -10,7 +10,8 @@ Bybit spot bot: правило 200 дней.
 
 Переменные окружения:
   BYBIT_API_KEY, BYBIT_API_SECRET   ключ субаккаунта (только торговля, без вывода)
-  TESTNET        "1" (по умолчанию) = торговать на testnet, "0" = реальный счёт
+  ACCOUNT        "demo" (по умолчанию) = демо-счёт Bybit с настоящими ценами,
+                 "testnet" = тестовая сеть, "live" = реальный счёт
   DRY_RUN        "1" (по умолчанию) = только посчитать и написать, без ордеров; "0" = торговать
   SYMBOL         по умолчанию BTCUSDT
   SMA_DAYS       по умолчанию 200
@@ -29,6 +30,7 @@ from decimal import Decimal, ROUND_DOWN
 
 MAINNET = "https://api.bybit.com"
 TESTNET = "https://api-testnet.bybit.com"
+DEMO = "https://api-demo.bybit.com"
 
 
 def env(name, default=None):
@@ -38,13 +40,15 @@ def env(name, default=None):
 
 SYMBOL = env("SYMBOL", "BTCUSDT")
 SMA_DAYS = int(env("SMA_DAYS", "200"))
-IS_TESTNET = env("TESTNET", "1") != "0"
+ACCOUNT = env("ACCOUNT", "demo").lower()
+if ACCOUNT not in ("demo", "testnet", "live"):
+    raise SystemExit("ACCOUNT должен быть demo, testnet или live")
 DRY_RUN = env("DRY_RUN", "1") != "0"
 API_KEY = env("BYBIT_API_KEY")
 API_SECRET = env("BYBIT_API_SECRET")
 TG_TOKEN = env("TG_TOKEN")
 TG_CHAT_ID = env("TG_CHAT_ID")
-TRADE_BASE = TESTNET if IS_TESTNET else MAINNET
+TRADE_BASE = {"demo": DEMO, "testnet": TESTNET, "live": MAINNET}[ACCOUNT]
 RECV_WINDOW = "10000"
 
 
@@ -166,7 +170,7 @@ def market_order(side, qty, unit):
 
 
 def main():
-    mode = ("TESTNET" if IS_TESTNET else "РЕАЛЬНЫЙ СЧЁТ") + (" · пробный запуск, без ордеров" if DRY_RUN else "")
+    mode = {"demo": "ДЕМО-СЧЁТ", "testnet": "TESTNET", "live": "РЕАЛЬНЫЙ СЧЁТ"}[ACCOUNT] + (" · пробный запуск, без ордеров" if DRY_RUN else "")
     up, close, sma, day = daily_signal()
     inst = instrument()
     base, quote = inst["base"], inst["quote"]
