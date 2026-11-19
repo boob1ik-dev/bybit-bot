@@ -13,7 +13,8 @@ Bybit spot bot: правило 200 дней.
   ACCOUNT        "demo" (по умолчанию) = демо-счёт Bybit с настоящими ценами,
                  "testnet" = тестовая сеть, "live" = реальный счёт
   DRY_RUN        "1" (по умолчанию) = только посчитать и написать, без ордеров; "0" = торговать
-  SYMBOL         по умолчанию BTCUSDT
+  SYMBOLS        пары через запятую, например BTCUSDT,ETHUSDT (по умолчанию BTCUSDT).
+                 Деньги делятся поровну: каждой паре своя доля счёта.
   SMA_DAYS       по умолчанию 200
   TG_TOKEN, TG_CHAT_ID   необязательно: уведомления в Telegram
 """
@@ -38,7 +39,8 @@ def env(name, default=None):
     return v.strip() if v and v.strip() else default
 
 
-SYMBOL = env("SYMBOL", "BTCUSDT")
+SYMBOLS = [x.strip().upper() for x in env("SYMBOLS", env("SYMBOL", "BTCUSDT")).split(",") if x.strip()]
+SYMBOL = ",".join(SYMBOLS)
 SMA_DAYS = int(env("SMA_DAYS", "200"))
 ACCOUNT = env("ACCOUNT", "demo").lower()
 if ACCOUNT not in ("demo", "testnet", "live"):
@@ -119,15 +121,15 @@ def notify(text):
 
 
 # ---------- Логика ----------
-def daily_signal(now_ms=None):
-    """Возвращает (выше_средней, цена_закрытия, средняя, дата) по ЗАКРЫТЫМ дневным свечам."""
+def daily_signal(symbol, now_ms=None):
+    """(выше_средней, цена_закрытия, средняя, дата) по ЗАКРЫТЫМ дневным свечам."""
     now_ms = now_ms or int(time.time() * 1000)
     today_start = now_ms - now_ms % 86_400_000
     rows = public_get("/v5/market/kline",
-                      {"category": "spot", "symbol": SYMBOL, "interval": "D", "limit": SMA_DAYS + 20})["list"]
+                      {"category": "spot", "symbol": symbol, "interval": "D", "limit": SMA_DAYS + 20})["list"]
     closed = sorted((r for r in rows if int(r[0]) < today_start), key=lambda r: int(r[0]))
     if len(closed) < SMA_DAYS:
-        raise RuntimeError(f"Мало истории: {len(closed)} дней из {SMA_DAYS}")
+        raise RuntimeError(f"{symbol}: мало истории — {len(closed)} дней из {SMA_DAYS}")
     closes = [float(r[4]) for r in closed[-SMA_DAYS:]]
     sma = sum(closes) / SMA_DAYS
     last = closes[-1]
@@ -135,8 +137,8 @@ def daily_signal(now_ms=None):
     return last > sma, last, sma, day
 
 
-def instrument():
-    info = public_get("/v5/market/instruments-info", {"category": "spot", "symbol": SYMBOL})["list"][0]
+def instrument(symbol):
+    info = public_get("/v5/market/instruments-info", {"category": "spot", "symbol": symbol})["list"][0]
     lot = info["lotSizeFilter"]
     return {
         "base": info["baseCoin"],
@@ -148,9 +150,9 @@ def instrument():
     }
 
 
-def balances(base, quote):
-    res = private("GET", "/v5/account/wallet-balance", {"accountType": "UNIFIED", "coin": f"{base},{quote}"})
-    out = {base: Decimal("0"), quote: Decimal("0")}
+def balances(coins):
+    res = private("GET", "/v5/account/wallet-balance", {"accountType": "UNIFIED", "coin": ",".join(coins)})
+    out = {c: Decimal("0") for c in coins}
     for acct in res.get("list", []):
         for c in acct.get("coin", []):
             if c["coin"] in out:
@@ -163,49 +165,74 @@ def floor_to(x, step):
     return (x / step).to_integral_value(rounding=ROUND_DOWN) * step
 
 
-def market_order(side, qty, unit):
-    params = {"category": "spot", "symbol": SYMBOL, "side": side, "orderType": "Market",
+def market_order(symbol, side, qty, unit):
+    params = {"category": "spot", "symbol": symbol, "side": side, "orderType": "Market",
               "qty": format(qty.normalize(), "f"), "marketUnit": unit}
     return private("POST", "/v5/order/create", params)
 
 
+def fmt_bal(bal, coins, quote):
+    return ", ".join(f"{bal[c].normalize()} {c}" for c in coins if c != quote) + f", {bal[quote]:,.2f} {quote}"
+
+
 def main():
-    mode = {"demo": "ДЕМО-СЧЁТ", "testnet": "TESTNET", "live": "РЕАЛЬНЫЙ СЧЁТ"}[ACCOUNT] + (" · пробный запуск, без ордеров" if DRY_RUN else "")
-    up, close, sma, day = daily_signal()
-    inst = instrument()
-    base, quote = inst["base"], inst["quote"]
-    head = (f"{SYMBOL} {mode}\nЗакрытие {day}: {close:,.2f}\nСредняя за {SMA_DAYS} дней: {sma:,.2f}\n"
-            f"Сигнал: {'ВЫШЕ средней → держим ' + base if up else 'НИЖЕ средней → держим ' + quote}")
+    mode = {"demo": "ДЕМО-СЧЁТ", "testnet": "TESTNET", "live": "РЕАЛЬНЫЙ СЧЁТ"}[ACCOUNT] + \
+           (" · пробный запуск, без ордеров" if DRY_RUN else "")
+    pairs = []
+    for sym in SYMBOLS:
+        up, close, sma, day = daily_signal(sym)
+        pairs.append({"sym": sym, "up": up, "close": close, "sma": sma, "day": day, **instrument(sym)})
+    quote = pairs[0]["quote"]
+    if any(p["quote"] != quote for p in pairs):
+        raise RuntimeError("Все пары должны торговаться к одной валюте (например, USDT)")
+    coins = [p["base"] for p in pairs] + [quote]
+    bal = balances(coins)
 
-    bal = balances(base, quote)
-    price = Decimal(str(close))
-    base_val = bal[base] * price
-    head += f"\nБаланс: {bal[base].normalize()} {base} (~{base_val:,.2f} {quote}) и {bal[quote]:,.2f} {quote}"
+    # Деньги делятся поровну между парами: каждой паре своя доля от всего счёта
+    equity = bal[quote] + sum(bal[p["base"]] * Decimal(str(p["close"])) for p in pairs)
+    slot = equity / len(pairs)
 
-    action = "Действий нет."
-    if up and bal[quote] >= inst["min_amt"]:
-        amt = floor_to(bal[quote] * Decimal("0.998"), inst["quote_step"])  # запас на комиссию
-        if amt >= inst["min_amt"]:
-            if DRY_RUN:
-                action = f"[пробно] Купил бы {base} на {amt} {quote}."
-            else:
-                r = market_order("Buy", amt, "quoteCoin")
-                action = f"Куплен {base} на {amt} {quote}. Ордер {r.get('orderId')}."
-    elif not up and base_val >= inst["min_amt"]:
-        qty = floor_to(bal[base], inst["base_step"])
-        if qty >= inst["min_qty"] and qty > 0:
-            if DRY_RUN:
-                action = f"[пробно] Продал бы {qty.normalize()} {base}."
-            else:
-                r = market_order("Sell", qty, "baseCoin")
-                action = f"Продано {qty.normalize()} {base}. Ордер {r.get('orderId')}."
+    lines = [f"Бот 200 дней · {mode}", f"Счёт ≈ {equity:,.2f} {quote}, на пару ≈ {slot:,.2f} {quote}"]
+    acted = False
 
-    if not DRY_RUN and not action.startswith("Действий"):
-        time.sleep(3)
-        b2 = balances(base, quote)
-        action += f"\nНовый баланс: {b2[base].normalize()} {base} и {b2[quote]:,.2f} {quote}"
+    # Сначала продажи (освобождают доллары), потом покупки
+    for p in sorted(pairs, key=lambda p: p["up"]):
+        base, price = p["base"], Decimal(str(p["close"]))
+        held_val = bal[base] * price
+        sig = f"выше средней ({p['sma']:,.2f}) → держим {base}" if p["up"] else \
+              f"ниже средней ({p['sma']:,.2f}) → держим {quote}"
+        line = f"\n{p['sym']}: закрытие {p['day']} {p['close']:,.2f}, {sig}.\n  В монете ≈ {held_val:,.2f} {quote}. "
+        action = "Действий нет."
+        if not p["up"] and held_val >= p["min_amt"]:
+            qty = floor_to(bal[base], p["base_step"])
+            if qty >= p["min_qty"] and qty > 0:
+                if DRY_RUN:
+                    action = f"[пробно] Продал бы {qty.normalize()} {base}."
+                    bal[quote] += qty * price
+                else:
+                    r = market_order(p["sym"], "Sell", qty, "baseCoin")
+                    action = f"Продано {qty.normalize()} {base}. Ордер {r.get('orderId')}."
+                    acted = True
+                    time.sleep(2)
+                    bal = balances(coins)
+        elif p["up"] and held_val < slot * Decimal("0.5"):
+            want = slot - held_val
+            amt = floor_to(min(bal[quote] * Decimal("0.998"), want), p["quote_step"])
+            if amt >= p["min_amt"]:
+                if DRY_RUN:
+                    action = f"[пробно] Купил бы {base} на {amt} {quote}."
+                    bal[quote] -= amt
+                else:
+                    r = market_order(p["sym"], "Buy", amt, "quoteCoin")
+                    action = f"Куплен {base} на {amt} {quote}. Ордер {r.get('orderId')}."
+                    acted = True
+                    time.sleep(2)
+                    bal = balances(coins)
+        lines.append(line + action)
 
-    notify(head + "\n" + action)
+    if acted:
+        lines.append("\nНовый баланс: " + fmt_bal(balances(coins), coins, quote))
+    notify("\n".join(lines))
 
 
 if __name__ == "__main__":
